@@ -54,23 +54,31 @@
 
 
 #define handle_error(msg) { fprintf(stderr, "%s %s(%d)\n", msg, strerror(errno), errno); exit(1); }
-const char* pathname = "/tmp/container1/uds";
 #define QUEUE 0
 #define XSK_MAX_ENTRIES 1
 #define OLD_KERNEL 0
 
 #define DEBUG 0
-#define RING_SIZE (2048 * 32)
+#define RING_SIZE (2048L * 16)
+// #define RING_SIZE (2048L)
 #define NANOSEC_PER_SEC 1000000000 /* 10^9 */
 #include "xsk_ops.h" //needs RING_SIZE
+
+int broken = 0;
 struct xsk_socket {
   int fd;
   uint64_t rx_packets;
   uint64_t rx_bytes;
   uint64_t tx_packets;
   uint64_t tx_bytes;
+  uint64_t batches;
 };
 
+void debug_xsk(struct xsk_socket* xsk) {
+	printf("debugging xdp socket with fd: %d\n", xsk->fd);
+	printf("Total packets sent: %ld\n", xsk->tx_packets);
+	printf("Total batches sent: %ld\n", xsk->batches);
+}
 
 static uint64_t gettime()
 {
@@ -90,22 +98,31 @@ static void *stats_poll(void *arg)
         unsigned int interval = 2;
         struct xsk_socket *xsk = arg;
         setlocale(LC_NUMERIC, "en_US");
-        uint64_t prev_time = 0, prev_tx_packets = 0, cur_time, cur_tx_packets;
-        double period = 0.0, tx_pps = 0.0;
+        uint64_t prev_time = 0, prev_tx_packets = 0, prev_batches, cur_time, cur_tx_packets, cur_batches;
+        double period = 0.0, tx_pps = 0.0, tx_batches = 0.0;
         while (1) {
                 sleep(interval);
+		if(broken) {
+			sleep(interval * 20);
+		}
                 if (prev_time == 0) {
                           prev_time = gettime();
                           prev_tx_packets = READ_ONCE(xsk->tx_packets);
+                          prev_batches = READ_ONCE(xsk->batches);
                           continue;
                 }
                 cur_time = gettime();
                 period = ((double) (cur_time - prev_time) / NANOSEC_PER_SEC);
 		prev_time = cur_time;
                 cur_tx_packets = READ_ONCE(xsk->tx_packets);
+                cur_batches = READ_ONCE(xsk->batches);
                 tx_pps = (cur_tx_packets - prev_tx_packets) / period;
+                tx_batches = (cur_batches - prev_batches) / period;
 		prev_tx_packets = cur_tx_packets;
+		prev_batches = cur_batches;
                 printf("tx pps: %'10.0f\n", tx_pps);
+                printf("tx batch/s: %'10.0f\n", tx_batches);
+		printf("Total sent: %08lx\n", xsk->tx_packets);
         }
 }
 
@@ -248,7 +265,7 @@ void bind_xsk(int xsk, int ifidx)
 	//sxdp.sxdp_flags = XDP_ZEROCOPY ;
 	//sxdp.sxdp_flags = XDP_USE_NEED_WAKEUP;
 	//sxdp.sxdp_flags = 0;
-	sxdp.sxdp_flags = 0;
+	//sxdp.sxdp_flags = 0;
 	if (bind(xsk, (struct sockaddr *)&sxdp, sizeof(struct sockaddr_xdp))) {
 		handle_error("bind socket failed");
 	}
@@ -311,15 +328,31 @@ void create_packet(void* data_, int payload_len) {
 	compute_ip_checksum(iph);
 }
 
-int send_batch(int fd, void* umem, struct umem_ring *com, struct kernel_ring *tx, void* pkt, int len) {
+int first_false(char *arr, int len) {
+	for (int i=0; i<len; i++) {
+		if (arr[i] == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+void print_all_false(char *arr, int len) {
+	for (int i=0; i<len; i++) {
+		if (arr[i] == 0) {
+			printf("Did not get buffer from idx %d", i);
+		}
+	}
+}
 
-	int batch_size = RING_SIZE;
+int send_batch(struct xsk_socket *xsk, void* umem, struct umem_ring *com, struct kernel_ring *tx, void* pkt, int len) {
+
+	int batch_size = RING_SIZE/4 + 5;
+	char seen[RING_SIZE/2] = {0};
 
 	int num_reserved = xsk_kr_prod_reserve(tx, batch_size);
 	if (num_reserved < batch_size) {
-		if(DEBUG) {
 			printf("no tx reserved\n");
-		}
+		xsk_kr_prod_reserve(tx, num_reserved);
 		return 0;
 	}
 	char *umem_char = ((char*) (umem));
@@ -333,33 +366,57 @@ int send_batch(int fd, void* umem, struct umem_ring *com, struct kernel_ring *tx
 		debug_kernel_ring(tx);
 	}
 	int total_recieved = 0;
+	long j=0;
 	while(total_recieved < batch_size) {
 		if(DEBUG) {
-			printf("Kicking fd %d.\n", fd);
+			printf("Kicking fd %d.\n", xsk->fd);
 		}
-		int ret = sendto(fd , NULL, 0, MSG_DONTWAIT, NULL, 0);
+		int ret = sendto(xsk->fd , NULL, 0, MSG_DONTWAIT, NULL, 0);
 		if (ret == -1 && DEBUG) {
 			printf("Got %d from sendto.\n", errno);
 		}
-		int recieved_packets = xsk_umem_cons_peek(com, (batch_size+3)/4);
+		int recieved_packets = xsk_umem_cons_peek(com, (batch_size+1)/2);
 		if (recieved_packets == 0) {
+			j++;
+			if( j==200000) {
+				int lost_buffer = first_false(seen, sizeof(seen));
+				printf("maybe lost a packet buffer at %d \n", lost_buffer);
+				debug_xsk(xsk);
+				debug_kernel_ring(tx);
+				debug_umem_ring(com);
+				broken = 1;
+				printf("slowly kicking forever to allow ptrace attach\n");
+				for (int k=0; k<10000; k++) {
+					sleep(10);
+					int ret = sendto(xsk->fd , NULL, 0, MSG_DONTWAIT, NULL, 0);
+					if (ret == -1 && DEBUG) {
+						printf("Got %d from sendto.\n", errno);
+					}
+				}
+			}
 			if(DEBUG) {
-				printf("still waiting on completion\n");
 				debug_kernel_ring(tx);
 				debug_umem_ring(com);
 				sleep(1);
 			}
 			continue;
 		}
+		j = 0;
 		if(DEBUG) {
 			printf("Got %d packets\n", recieved_packets);
 			debug_umem_ring(com);
 		}
-		int idx = xsk_umem_cons_read(com);
-		if(DEBUG) {
-			printf("Got back idx: %d\n", idx);
-			debug_kernel_ring(tx);
-			debug_umem_ring(com);
+		for (int i=0; i<recieved_packets; i++) {
+			int idx = xsk_umem_cons_read(com)/4096;
+			if(DEBUG) {
+				printf("Got back idx: %d\n", idx);
+				debug_kernel_ring(tx);
+				debug_umem_ring(com);
+			}
+			if (seen[idx]) {
+				printf("Got back the same packet twice at idx %d\n", idx);
+			}
+			seen[idx] = 1;
 		}
 		xsk_umem_cons_release(com, recieved_packets);
 		total_recieved += recieved_packets;
@@ -383,7 +440,7 @@ int main(int argc, char** argv)
 
 	if (argc < 2)
 	{
-		printf("usage: socket.o ifidx");
+		printf("usage: socket.o ifidx [sleep]");
 		return -1;
 	}
 	int ifidx = atoi(argv[1]);
@@ -409,15 +466,20 @@ int main(int argc, char** argv)
 	void* golden_packet = malloc(256);
 	create_packet(golden_packet, 10);
 
+	if (argc > 3 && argv[2][0] == 's') {
+		printf("sleping for a long time for debugging");
+		sleep(10000);
+	}
         pthread_t stats_poll_thread;
 	printf("creating stats thread\n");
         int ret = pthread_create(&stats_poll_thread, NULL, stats_poll, &xsk_sock);
         if (ret) {
               handle_error("error creating stats thraed");
         }
-	while(1) {
-		int sent_packets = send_batch(xsk, umem, &com, &tx, golden_packet, 256);
+	while(!broken) {
+		int sent_packets = send_batch(&xsk_sock, umem, &com, &tx, golden_packet, 256);
 		xsk_sock.tx_packets += sent_packets;
+		xsk_sock.batches += 1;
 	}
 	//dumb_poll(&xsk_sock, umem, &fill, &rx);
 

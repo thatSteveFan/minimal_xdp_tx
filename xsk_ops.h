@@ -37,8 +37,8 @@ struct kernel_ring {
         struct xdp_desc *ring;
 };
 
-int prod_idx=0;
-int cons_idx=0;
+long long prod_idx=0;
+long long cons_idx=0;
 
 static inline __u32 debug_umem_cons(struct umem_ring* u)
 {
@@ -66,10 +66,10 @@ static inline __u32 debug_kernel_prod(struct kernel_ring* u)
 }	
 
 static inline void debug_umem_ring(struct umem_ring *u) {
-	printf("umem ring prod: %d, cons: %d\n", debug_umem_prod(u), debug_umem_cons(u));
+	printf("umem ring prod: %x, cons: %x\n", debug_umem_prod(u), debug_umem_cons(u));
 }
 static inline void debug_kernel_ring(struct kernel_ring *u) {
-	printf("kernel ring prod: %d, cons: %d\n", debug_kernel_prod(u), debug_kernel_cons(u));
+	printf("kernel ring prod: %x, cons: %x\n", debug_kernel_prod(u), debug_kernel_cons(u));
 }
 
 static inline __u32 xsk_umem_prod_nb_free(struct umem_ring *r, __u32 nb)
